@@ -102,6 +102,22 @@ final class AntigravityActivityMonitor: AgentActivityMonitor {
         return [session]
     }
 
+    /// Windows read from the end of `transcript.jsonl`, starting small for the
+    /// common case and expanding only when a single line (such as a large tool
+    /// output or compaction checkpoint) spans more than the initial slice.
+    private static let tailWindowSizes = [64 * 1024, 256 * 1024, 1024 * 1024]
+
+    enum ParsedTail: Equatable {
+        /// A substantive transcript entry settled the turn's state.
+        case resolved(AgentSession.State, waitingFor: String?)
+        /// No substantive entry could be parsed from the tail (for example a
+        /// single line larger than the window, a line caught mid-write, or a
+        /// trailing metadata-only slice).
+        case unresolved
+        /// The transcript file is empty.
+        case empty
+    }
+
     static func tail(of url: URL, bytes: Int = 64 * 1024) -> Data? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
@@ -112,37 +128,55 @@ final class AntigravityActivityMonitor: AgentActivityMonitor {
     }
 
     static func parseState(inTail data: Data) -> (state: AgentSession.State, waitingFor: String?) {
+        switch parseTail(data) {
+        case .resolved(let state, let waitingFor):
+            return (state, waitingFor)
+        case .unresolved, .empty:
+            return (.idle, nil)
+        }
+    }
+
+    static func parseTail(_ data: Data) -> ParsedTail {
         let lines = data.split(separator: UInt8(ascii: "\n"), omittingEmptySubsequences: true)
-        
+        guard !lines.isEmpty else { return .empty }
+
         var isTurnOver = false
-        
+
         for line in lines.reversed() {
             guard let json = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
                   let type = json["type"] as? String else { continue }
-            
+
             if type == "USER_INPUT" {
                 if isTurnOver {
-                    return (.idle, nil)
+                    return .resolved(.idle, waitingFor: nil)
                 } else {
-                    return (.busy, nil)
+                    return .resolved(.busy, waitingFor: nil)
                 }
             } else if type == "PLANNER_RESPONSE" {
                 if let toolCalls = json["tool_calls"] as? [[String: Any]], !toolCalls.isEmpty {
                     for call in toolCalls {
                         guard let name = call["name"] as? String else { continue }
-                        if name.contains("ask_question") {
-                            return (.waiting, L10n.t("Question"))
+                        // `ask_question` blocks until answered; once a later
+                        // response closes the turn (`isTurnOver`), the question
+                        // was already answered and must not trap the session in
+                        // `.waiting` or fire a false blocked alert.
+                        if !isTurnOver && name.contains("ask_question") {
+                            return .resolved(.waiting, waitingFor: L10n.t("Question"))
                         }
-                        if name.contains("multi_replace_file_content") || name.contains("write_to_file") || name.contains("replace_file_content") {
+                        if name.contains("multi_replace_file_content")
+                            || name.contains("write_to_file")
+                            || name.contains("replace_file_content")
+                            || name.contains("write_file")
+                            || name.contains("edit_file") {
                             if let args = call["arguments"] as? [String: Any],
                                let meta = args["ArtifactMetadata"] as? [String: Any],
                                meta["RequestFeedback"] as? Bool == true {
-                                return (.waiting, L10n.t("Approval"))
+                                return .resolved(.waiting, waitingFor: L10n.t("Approval"))
                             }
                         }
                     }
                     if !isTurnOver {
-                        return (.busy, nil)
+                        return .resolved(.busy, waitingFor: nil)
                     }
                 } else {
                     isTurnOver = true
@@ -151,12 +185,36 @@ final class AntigravityActivityMonitor: AgentActivityMonitor {
                 continue
             } else {
                 if !isTurnOver {
-                    return (.busy, nil) // A tool response
+                    return .resolved(.busy, waitingFor: nil) // A tool response
                 }
             }
         }
-        
-        return (.idle, nil)
+
+        if isTurnOver {
+            return .resolved(.idle, waitingFor: nil)
+        }
+        return .unresolved
+    }
+
+    private static func readTailState(of url: URL) -> ParsedTail {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return .empty }
+        defer { try? handle.close() }
+        guard let end = try? handle.seekToEnd() else { return .empty }
+        guard end > 0 else { return .empty }
+
+        for bytes in tailWindowSizes {
+            let start = end > UInt64(bytes) ? end - UInt64(bytes) : 0
+            guard (try? handle.seek(toOffset: start)) != nil,
+                  let data = try? handle.readToEnd() else { return .unresolved }
+            let parsed = parseTail(data)
+            if case .resolved = parsed {
+                return parsed
+            }
+            if start == 0 {
+                return parsed
+            }
+        }
+        return .unresolved
     }
 
     /// Only a transcript written within the window counts. An older one is a
@@ -165,24 +223,48 @@ final class AntigravityActivityMonitor: AgentActivityMonitor {
     static func session(
         trajectory: URL, modified: Date, staleAfter: TimeInterval, now: Date
     ) -> AgentSession? {
-        var (state, waitingFor) = tail(of: trajectory).map(parseState(inTail:)) ?? (.idle, nil)
-        
+        let age = now.timeIntervalSince(modified)
+        var state: AgentSession.State
+        var waitingFor: String?
+
+        switch readTailState(of: trajectory) {
+        case .resolved(let parsedState, let parsedWaitingFor):
+            state = parsedState
+            waitingFor = parsedWaitingFor
+        case .unresolved:
+            // A freshly written transcript whose tail cannot be parsed (e.g. a
+            // single >1 MB tool output or a line caught mid-write) is active
+            // work, never a finished turn.
+            guard age <= staleAfter else { return nil }
+            state = .busy
+            waitingFor = nil
+        case .empty:
+            return nil
+        }
+
         if state == .busy {
             let conversationID = trajectory.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().lastPathComponent
             let dbURL = trajectory.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("conversations/" + conversationID + ".db")
-            
+
             if let db = SQLiteStore.open(dbURL) {
                 defer { sqlite3_close(db) }
-                let rows = SQLiteStore.rows(in: db, sql: "SELECT status FROM steps ORDER BY idx DESC LIMIT 1")
-                if let first = rows.first, first.first == "2" {
+                // `status` is Antigravity's CortexStepStatus: 1 is PENDING,
+                // 2 is RUNNING (every active tool call), 3 is DONE, and 9 is
+                // WAITING (held for user permission). Treating 2 as a wait
+                // flipped busy to waiting on every tool call in flight (#584).
+                // Skip trailing PENDING (1) rows so a queued parallel step does
+                // not hide a WAITING (9) step ahead of it.
+                let rows = SQLiteStore.rows(
+                    in: db,
+                    sql: "SELECT status FROM steps WHERE status != 1 ORDER BY idx DESC LIMIT 1"
+                )
+                if rows.first == "9" {
                     state = .waiting
                     waitingFor = L10n.t("Permission")
                 }
             }
         }
-        
-        let age = now.timeIntervalSince(modified)
-        
+
         if state == .idle {
             if age <= 9 {
                 state = .success

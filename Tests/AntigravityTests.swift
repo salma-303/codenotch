@@ -1206,6 +1206,131 @@ final class AntigravityActivityMonitorTests: XCTestCase {
         XCTAssertEqual(sessions.first?.detail, "Question")
     }
 
+    // MARK: - Conversation step statuses & false-alert regressions (#584)
+
+    /// A turn mid tool call laid out as Antigravity stores it: `brain/<id>`
+    /// beside `conversations/<id>.db`, whose `steps` table carries
+    /// `CortexStepStatus` values.
+    private func turnInFlight(stepStatuses: [Int]) throws -> URL {
+        let brain = root.appendingPathComponent("brain")
+        let logs = brain.appendingPathComponent("c1/.system_generated/logs")
+        try FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+        try """
+        {"type": "USER_INPUT"}
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]}
+        """.write(to: logs.appendingPathComponent("transcript.jsonl"), atomically: true, encoding: .utf8)
+
+        let conversations = root.appendingPathComponent("conversations")
+        try FileManager.default.createDirectory(at: conversations, withIntermediateDirectories: true)
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(conversations.appendingPathComponent("c1.db").path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+        sqlite3_exec(db, "CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER);", nil, nil, nil)
+        for (idx, status) in stepStatuses.enumerated() {
+            sqlite3_exec(db, "INSERT INTO steps VALUES (\(idx), 132, \(status));", nil, nil, nil)
+        }
+        return brain
+    }
+
+    /// 2 is CORTEX_STEP_STATUS_RUNNING: every tool call in flight. Reading it
+    /// as a wait flipped busy -> waiting and peeked/chimed on every tool (#584).
+    func testARunningStepIsWorkNotAWait() throws {
+        let brain = try turnInFlight(stepStatuses: [3, 3, 2])
+        let sessions = AntigravityActivityMonitor.read(root: brain, staleAfter: 45)
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions.first?.state, .busy)
+    }
+
+    /// 9 is CORTEX_STEP_STATUS_WAITING: the step held for user permission.
+    func testAWaitingStepAsksForPermission() throws {
+        let brain = try turnInFlight(stepStatuses: [3, 3, 9])
+        let sessions = AntigravityActivityMonitor.read(root: brain, staleAfter: 45)
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions.first?.state, .waiting)
+        XCTAssertEqual(sessions.first?.detail, "Permission")
+    }
+
+    /// Parallel tool calls queue trailing PENDING (1) rows behind the active
+    /// step; a queued step must neither hide a WAITING (9) prompt nor make a
+    /// RUNNING (2) step look blocked.
+    func testTrailingPendingStepFollowsActiveStepStatus() throws {
+        let waitingBrain = try turnInFlight(stepStatuses: [3, 9, 1])
+        let waiting = AntigravityActivityMonitor.read(root: waitingBrain, staleAfter: 45)
+        XCTAssertEqual(waiting.first?.state, .waiting)
+        XCTAssertEqual(waiting.first?.detail, "Permission")
+
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        let runningBrain = try turnInFlight(stepStatuses: [3, 2, 1])
+        let running = AntigravityActivityMonitor.read(root: runningBrain, staleAfter: 45)
+        XCTAssertEqual(running.first?.state, .busy)
+    }
+
+    /// Once an earlier `ask_question` has been answered and a later
+    /// `PLANNER_RESPONSE` closes the turn, the turn is complete rather than
+    /// stuck in `.waiting ("Question")`.
+    func testAnAnsweredQuestionDoesNotReTriggerWaitingWhenTurnEnds() throws {
+        let content = """
+        {"type": "USER_INPUT"}
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "ask_question"}]}
+        {"type": "GENERIC", "content": "A1: Yes"}
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]}
+        {"type": "GENERIC", "content": "ok"}
+        {"type": "PLANNER_RESPONSE", "content": "All done."}
+        """
+        try transcript("answered", modified: Date(), content: content)
+        let sessions = AntigravityActivityMonitor.read(root: root, staleAfter: 45)
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions.first?.state, .success)
+        XCTAssertEqual(sessions.first?.detail, "Complete")
+    }
+
+    /// A tool result larger than the 64 KB initial tail must expand the window
+    /// and remain `.busy` rather than falling through to `.idle` / `.success`.
+    func testALargeToolResultOver64KStaysBusyInsteadOfFiringComplete() throws {
+        let bigOutput = String(repeating: "x", count: 80 * 1024)
+        let content = """
+        {"type": "USER_INPUT"}
+        {"type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command"}]}
+        {"type": "GENERIC", "content": "\(bigOutput)"}
+        """
+        try transcript("large-tool", modified: Date(), content: content)
+        let sessions = AntigravityActivityMonitor.read(root: root, staleAfter: 45)
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions.first?.state, .busy)
+    }
+
+    /// A final response larger than 64 KB must still expand the tail and report
+    /// completion once the turn ends.
+    func testALargeFinalResponseOver64KReadsAsComplete() throws {
+        let bigReply = String(repeating: "a", count: 80 * 1024)
+        let content = """
+        {"type": "USER_INPUT"}
+        {"type": "PLANNER_RESPONSE", "content": "\(bigReply)"}
+        """
+        try transcript("large-reply", modified: Date(), content: content)
+        let sessions = AntigravityActivityMonitor.read(root: root, staleAfter: 45)
+        XCTAssertEqual(sessions.count, 1)
+        XCTAssertEqual(sessions.first?.state, .success)
+    }
+
+    /// A freshly written line caught mid-write (or exceeding the max tail) must
+    /// stay `.busy` instead of firing a false completion; an empty file reports
+    /// no session at all.
+    func testMidWriteLineStaysBusyAndEmptyTranscriptIsQuiet() throws {
+        try transcript("partial", modified: Date(), content: "{\"type\": \"GENERIC\", \"content\": \"unterminated")
+        let partial = AntigravityActivityMonitor.read(root: root, staleAfter: 45)
+        XCTAssertEqual(partial.count, 1)
+        XCTAssertEqual(partial.first?.state, .busy)
+
+        try FileManager.default.removeItem(at: root)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+
+        try transcript("empty", modified: Date(), content: "")
+        XCTAssertTrue(AntigravityActivityMonitor.read(root: root, staleAfter: 45).isEmpty)
+    }
+
     func testNoTranscriptsIsQuietRatherThanAnError() {
         let absent = root.appendingPathComponent("nowhere")
         XCTAssertTrue(AntigravityActivityMonitor.read(root: absent, staleAfter: 45).isEmpty)
